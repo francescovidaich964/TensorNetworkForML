@@ -60,7 +60,7 @@ class Tensor():
         """
         # Numeric initialization
         if (elem is None) and (shape is not None):
-            self.elem = np.random.random(size=shape) # uniform in [0,1]
+            self.elem = np.random.random(size=shape) - 0.5 # uniform in [0,1]
             self.elem /= scale 
         elif elem is not None:
             self.elem = elem
@@ -284,3 +284,15 @@ class Tensor():
         T3 = Tensor(elem = t3, axes_names = self.axes_names)
         return T3
 
+    def __sub__(self, o): 
+        """
+        Perform sum of two tensors permuting the axes of the second so that they are alligned.
+        """
+
+        # check all names match between two tensors
+        assert np.all(np.isin(self.axes_names, o.axes_names)), "Error: axes don't match, cannot sum tensors."
+
+        o.transpose(self.axes_names)
+        t3 = self.elem - o.elem
+        T3 = Tensor(elem = t3, axes_names = self.axes_names)
+        return T3

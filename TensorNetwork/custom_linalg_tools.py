@@ -79,7 +79,7 @@ def _contract_(T1, T2, contracted_axis1, contracted_axis2, common_axis1=[], comm
     #    T3_axes_names = None
 
     T3 = (T1.elem.reshape(new_shape1)*T2.elem.reshape(new_shape2))
-    if len(contracted_axis1) > 0:
+    for i in range(len(contracted_axis1)):
         # if len(contracted_axis1) == 0 just to tensor product
         T3 = T3.sum(axis=-1)
         

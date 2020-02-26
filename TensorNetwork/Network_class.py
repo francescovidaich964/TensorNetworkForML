@@ -82,6 +82,9 @@ class Network():
         self.M = M
         
         self.As = []
+
+        # position of the tensor with additional dimension for the output of the net
+        self.l_pos = 0
         
         if normalize:
             print('Normalizing weights...')
@@ -98,6 +101,7 @@ class Network():
             self.As.append(Tensor(shape=[L,M,D], axes_names=['l','right','d0'], scale = scale))
             for i in range(1,N-1):
                 self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)], scale = scale))
+                #print(self.As[i].elem)
             self.As.append(Tensor(shape=[M,D], axes_names=['left','d'+str(N-1)], scale = scale))
             
             if calibration_X is None:
@@ -133,12 +137,10 @@ class Network():
             
         else:
             # without normalization each entry of each A is a random number in [0,1]
-            self.As.append(Tensor(shape=[L,M,M,D], axes_names=['l','left','right','d0']))
-            for i in range(1,N):
+            self.As.append(Tensor(shape=[L,M,D], axes_names=['l','right','d0']))
+            for i in range(1,N-1):
                 self.As.append(Tensor(shape=[M,M,D], axes_names=['left','right','d'+str(i)]))
-        
-        # position of the tensor with additional dimension for the output of the net
-        self.l_pos = 0
+            self.As.append(Tensor(shape=[M,D], axes_names=['left','d'+str(N-1)]))
 
         return
     
@@ -172,7 +174,8 @@ class Network():
         TX = []
         for i in range(self.N):
             TX.append(Tensor(elem=X[:,i,:], axes_names=['b','d'+str(i)]))
-                      
+        self.TX = TX              
+
         # This must be futher investigate, three ways:
         #     * numpy vectorize
         #     * list comprehension
@@ -182,23 +185,38 @@ class Network():
         
         A_TX = [contract(self.As[i], TX[i], contracted='d'+str(i)) for i in range(self.N)]
         cum_contraction = []
-        cum_contraction.append(A_TX[-1])
-        for j in range(1,self.N): 
-            tmp_cum = copy.deepcopy(cum_contraction[-1])
-            tmp_cum = contract(A_TX[-(j+1)], tmp_cum, 'right', 'left', common='b')
-            cum_contraction.append(tmp_cum)
+        
+        # Compute forward with L or R cum_contraptions depending on the sweep to do
+        if self.l_pos == 0:
+            # Prepare for right_sweep
+            cum_contraction.append(A_TX[-1])
+            for j in range(1,self.N): 
+                tmp_cum = copy.deepcopy(cum_contraction[-1])
+                tmp_cum = contract(A_TX[-(j+1)], tmp_cum, 'right', 'left', common='b')
+                cum_contraction.append(tmp_cum)
 
-        self.r_cum_contraction = cum_contraction[::-1]
-        self.left_contraction = None
-        self.TX = TX
+            self.r_cum_contraction = cum_contraction[::-1]
+            self.l_cum_contraction = None
+            return self.r_cum_contraction[0]
+
+        elif self.l_pos == self.N-1:
+            # Prepare for right_sweep
+            cum_contraction.append(A_TX[0])
+            for j in range(1,self.N): 
+                tmp_cum = copy.deepcopy(cum_contraction[-1])
+                tmp_cum = contract(tmp_cum, A_TX[j], 'right', 'left', common='b')
+                cum_contraction.append(tmp_cum)
+
+            self.r_cum_contraction = None
+            self.l_cum_contraction = cum_contraction #left are already ordered
+            return self.l_cum_contraction[-1]
 
         ### ORIGINAL ###
         #out = partial_trace(self.r_cum_contraction[0], 'right', 'left') # close the circle
         #return out
-        return self.r_cum_contraction[0]
 
 
-    def train(self, train_loader, val_loader, lr, n_epochs = 10, early_stopping = False, print_freq = 100):
+    def train(self, train_loader, val_loader, lr, n_epochs = 10, weight_dec=0.001, early_stopping = False, print_freq = 100):
         """
         Trains the network
         
@@ -226,10 +244,18 @@ class Network():
         train_acc = []
         val_acc = []
 
+        ######  DEBUG  ######
+        var_hist = []
+        #####################
+
         # if early_stopping = False
         for epoch in tnrange(n_epochs, desc="Epoch loop", leave = True):
             epoch_train_acc = np.zeros(len(train_loader))
-           
+            
+            ######  DEBUG  ######
+            var_hist.append([[],[],[],[],[],[],[]])
+            #####################
+
             # train
             print_every = int(len(train_loader)/print_freq)
             for i, data in enumerate(train_loader, 0):
@@ -244,9 +270,9 @@ class Network():
                 
                 # Select r/l sweep depending on l_pos
                 if self.l_pos == 0:
-                    f = self.r_sweep(x, y, f, lr)
+                    f = self.r_sweep(x, y, f, lr, weight_dec, var_hist[-1])
                 elif self.l_pos == self.N-1:
-                    f = self.l_sweep(x, y, f, lr)
+                    f = self.l_sweep(x, y, f, lr, weight_dec, var_hist[-1])
                 else:
                     print("\nl index is neither at the end or at the beginning of the net\n")
                 
@@ -274,7 +300,7 @@ class Network():
             val_acc.append(epoch_val_acc.mean())
             print('\r'+"Epoch %d - train accuracy : %.4f - val accuracy: %.4f"%(epoch, train_acc[-1], val_acc[-1]))
         
-        return train_acc, val_acc
+        return train_acc, val_acc, var_hist
     
 
     def accuracy(self, X, y, f=None):
@@ -306,8 +332,8 @@ class Network():
         return accuracy
   
 
-    ### ORIGINAL (same batch for right and òeft sweep) ###
-    def sweep(self, X, y, f, lr):
+    ### ORIGINAL (same batch for right and left sweep) ###
+    def sweep(self, X, y, f, lr, weight_dec):
         """
         Makes an optimization "sweep" , consisting of optimizing each pair
         of adjacent Tensors As[i] As[i+1] from i=0 to i=N-1
@@ -341,18 +367,18 @@ class Network():
         # sweep from left to right
         for i in range(self.N-1):
             #print("\nright sweep step ",i)
-            f = self.r_sweep_step(f, y, lr, batch_size)
+            f = self.r_sweep_step(f, y, lr, batch_size, weight_dec)
         
         self.r_cum_contraction = [] # init right cumulative contraction array
         # sweep from right to left
         for i in range(self.N-1):
             #print("\nleft sweep step ",self.N-1-i)
-            f = self.l_sweep_step(f, y, lr, batch_size)
+            f = self.l_sweep_step(f, y, lr, batch_size, weight_dec)
         
         return f
 
 
-    def r_sweep(self, X, y, f, lr):
+    def r_sweep(self, X, y, f, lr, weight_dec, var_hist=None):
         """
         Makes an optimization "sweep" , consisting of optimizing each pair
         of adjacent Tensors As[i] As[i+1] from i=0 to i=N-1
@@ -387,11 +413,11 @@ class Network():
         # sweep from left to right
         for i in range(self.N-1):
             #print("\nright sweep step ",i)
-            f = self.r_sweep_step(f, y, lr, batch_size)
+            f = self.r_sweep_step(f, y, lr, batch_size, weight_dec, var_hist)
         return f
     
 
-    def l_sweep(self, X, y, f, lr):
+    def l_sweep(self, X, y, f, lr, weight_dec, var_hist=None):
         """
         Makes an optimization "sweep", consisting of optimizing each pair
         of adjacent Tensors As[i] As[i-1] from i=N-1 to i=0
@@ -426,11 +452,11 @@ class Network():
         # sweep from right to left
         for i in range(self.N-1):
             #print("\nleft sweep step ",self.N-1-i)
-            f = self.l_sweep_step(f, y, lr, batch_size)
+            f = self.l_sweep_step(f, y, lr, batch_size, weight_dec, var_hist)
         return f
             
 
-    def r_sweep_step(self, f, y, lr, batch_size):
+    def r_sweep_step(self, f, y, lr, batch_size, weight_dec, var_hist=None):
         """
         Makes a step of the optimization "sweep", consisting in the optimization of
         a pair of Tensors As[i] As[i+1]
@@ -457,7 +483,7 @@ class Network():
         l = self.l_pos
         
         B = contract(self.As[l], self.As[l+1], "right", "left")    
-        
+
         # computing all elements for delta_B
         # Contributions:
         # - TX[l]    (always))
@@ -507,23 +533,15 @@ class Network():
         
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-f.elem)**2).mean()
+        MAE = np.abs(y-f.elem).mean()
         #print("Accuracy (before optim.): ", accuracy)
-        #print("MSE (before optim.): ", MSE)
+        #print("MAE (before optim.): ", MAE)
         ######################################################
         
-        #print('f_in: ', np.abs(f.elem).sum()) # debug
-        f.elem = y-f.elem # overwrite f with (target - prediction)
-  
+        #f.elem = y-f.elem # overwrite f with (target - prediction)
+        f_tmp = f.elem
+        f.elem = y/f.elem
         deltaB = contract(f, phi, contracted="b")
-        # gradient clipping -> rescale all elements of the gradient so that the
-        # norm does not exceed the sum of the absolute values of B's entries
-        B_measure = np.abs(B.elem).sum()
-
-        if np.abs(deltaB.elem).sum() > B_measure:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
-        deltaB.elem *= lr # multiply gradient for learning rate
-        #print('DeltaB: ', np.abs(deltaB.elem).sum()) # debug
 
         ### ORIGINAL ###
         ## change left and right indices 
@@ -543,6 +561,33 @@ class Network():
             right_index = deltaB.ax_to_index('right')
             deltaB.axes_names[right_index] = 'left'
 
+        # Perform L2 regularization 
+        L2_loss_term, L2_gradient = self.compute_L2_reg(B, weight_dec)
+        deltaB -= L2_gradient
+
+
+        ########## DEBUG ##########
+        # Store history of B, deltaB, accuracy, output and MAE before the update:
+        if var_hist is not None:
+            var_hist[0].append(np.abs(B.elem).mean())
+            var_hist[1].append(np.abs(deltaB.elem).mean())
+            var_hist[2].append(accuracy)
+            var_hist[3].append(np.abs(f_tmp).mean())
+            var_hist[4].append(MAE)
+            var_hist[5].append(L2_loss_term)
+            var_hist[6].append(np.abs(L2_gradient.elem).mean())
+        ###########################
+
+        
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+
+        #deltaB.elem /= np.max(np.abs(deltaB.elem))
+        deltaB.elem *= lr # multiply gradient for learning rate
+        #print('DeltaB: ', np.abs(deltaB.elem).sum()) # debug
 
         #print('B: \t', np.abs(B.elem).sum())
         # just trying to regularize
@@ -571,9 +616,9 @@ class Network():
         #print("Prediction (after optim.): ", y_pred)
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-out.elem)**2).mean()
+        MAE = np.abs(y-f.elem).mean()
         #print("Accuracy (after optim.): ", accuracy)
-        #print("MSE (after optim.): ", MSE)
+        #print("MAE (after optim.): ", MAE)
         ######################################################
         
         ### ORIGINAL ###
@@ -608,7 +653,7 @@ class Network():
         return out
     
 
-    def l_sweep_step(self, f, y, lr, batch_size):
+    def l_sweep_step(self, f, y, lr, batch_size, weight_dec, var_hist=None):
         """
         Makes a step of the optimization "sweep", consisting in the optimization of
         a pair of Tensors As[i] As[i+1]
@@ -636,6 +681,7 @@ class Network():
 
         B = contract(self.As[l-1], self.As[l], "right", "left")
         
+
         # (always true)
         # computing all elements for delta_B
         # Contributions:
@@ -649,7 +695,7 @@ class Network():
         
         if l == self.N-1:
             # tensor product with broadcasting on batch axis
-            phi = contract(phi, self.l_cum_contraction[-1], common = "b")
+            phi = contract(phi, self.l_cum_contraction[-3], common = "b")
             
         elif (l > 1) and (l<(self.N-1)):
             # compute new term for the right contribute
@@ -687,22 +733,17 @@ class Network():
         
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-f.elem)**2).mean()
+        MAE = np.abs(y-f.elem).mean()
         #print("Accuracy (before optim.): ", accuracy)
-        #print("MSE (before optim.): ", MSE)
+        #print("MAE (before optim.): ", MAE)
         ######################################################
         
         #print('f: ', np.abs(f.elem).sum())
-        f.elem = y-f.elem  # overwrite f with (target - prediction)
-
+        #f.elem = y-f.elem  # overwrite f with (target - prediction)
+        f_tmp = f.elem
+        f.elem = y/f.elem
         deltaB = contract(f, phi, contracted="b")
 
-        # gradient clipping -> rescale all elements of the gradient so that the
-        # norm does not exceed the sum of the absolute values of B's entries
-        B_measure = np.abs(B.elem).sum()
-        if np.abs(deltaB.elem).sum() > B_measure:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
-        deltaB.elem *= lr
 
         ### ORIGINAL ###
         ## change left and right indices 
@@ -710,26 +751,51 @@ class Network():
         #right_index = deltaB.ax_to_index('right')
         #deltaB.axes_names[left_index] = 'right'
         #deltaB.axes_names[right_index] = 'left'
-        if (l == 1):
+        if l==1:
             left_index = deltaB.ax_to_index('left')
             deltaB.axes_names[left_index] = 'right'
-        elif (l > 1) and (l < (self.N-1)):
+        elif (l > 1) and (l<(self.N-1)):
             left_index = deltaB.ax_to_index('left')
             right_index = deltaB.ax_to_index('right')
             deltaB.axes_names[left_index] = 'right'
             deltaB.axes_names[right_index] = 'left'
         else: 
             right_index = deltaB.ax_to_index('right')
-            deltaB.axes_names[right_index] = 'left'        
-        
+            deltaB.axes_names[right_index] = 'left'
+
+        # Perform L2 regularization 
+        L2_loss_term, L2_gradient = self.compute_L2_reg(B, weight_dec, inverse=True)
+        deltaB -= L2_gradient
+
+
+        ########## DEBUG ##########
+        # Store history of B, deltaB, accuracy, output and MAE before the update:
+        if var_hist is not None:
+            var_hist[0].append(B.elem.sum())
+            var_hist[1].append(np.abs(deltaB.elem).mean())
+            var_hist[2].append(accuracy)
+            var_hist[3].append(np.abs(f_tmp).mean())
+            var_hist[4].append(MAE)
+            var_hist[5].append(L2_loss_term)
+            var_hist[6].append(np.abs(L2_gradient.elem).mean())
+        ###########################
+
+
+        # gradient clipping -> rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure    
+
+        #deltaB.elem /= np.max(np.abs(deltaB.elem))
+        deltaB.elem *= lr # multiply gradient for learning rate
+        #print('DeltaB: ', np.abs(deltaB.elem).sum()) # debug
 
         #print('B: \t', np.abs(B.elem).sum()), 
         #print('deltaB: ', np.abs(deltaB.elem).sum())
 
-        # update B     
+        # update B    
         B = B + deltaB
-        
-        #print('B.elem.sum() (after update): ', B.elem.sum())
             
         # compute new output of the net (out is like f, but with new A weights)
         out = contract(B, self.TX[l-1], contracted='d'+str(l-1))
@@ -737,7 +803,7 @@ class Network():
         
         if l == self.N-1:
             # no right term
-            out = contract(self.l_cum_contraction[-1], out, 'right', 'left', common = "b") # ok
+            out = contract(self.l_cum_contraction[-3], out, 'right', 'left', common = "b") # ok
         
         elif (l > 1) and (l<(self.N-1)):
             # both right and left terms
@@ -757,9 +823,9 @@ class Network():
         #print("Prediction (after optim.): ", y_pred)
         errors = (y_target!=y_pred).sum()
         accuracy = (len(y_pred)-errors)/len(y_pred)
-        MSE = ((y-out.elem)**2).mean()
+        MAE = np.abs(y-f.elem).mean()
         #print("Accuracy (after optim.): ", accuracy)
-        #print("MSE (after optim.): ", MSE)
+        #print("MAE (after optim.): ", MAE)
         ######################################################
 
         ### ORIGINAL ###
@@ -937,3 +1003,197 @@ class Network():
 
             return TUS, TSVh#, cumulative_variance_explained[m-1]
 
+
+    def compute_L2_reg(self, B, weight_dec=0.001, inverse=False):
+
+        # L2 norm of the weights of the network can be computed by contracting
+        # all tensors A and then contracting all of it to a copy of itself
+        # thorugh all inputs (working if self.l_pos is not updated)
+
+        # Since the memory can't store the tensor of the contracted network, 
+        # we contract the tensors over each input before contracting the whole thing
+
+
+        # Contract tensors on the right and on the left of B (depending on sweep direction)
+        if inverse == False:
+
+            # Case of right sweep (l from 0 to N-2):
+            # Contract tensors on the left (if needed)
+            if self.l_pos != 0:
+
+                # copy tensor and rename indexes before contracting it to itself
+                tmp_tensor = copy.deepcopy(self.As[0])
+                tmp_tensor_2 = copy.deepcopy(self.As[0])
+                #left_index = tmp_tensor_2.ax_to_index('left')    # As[0] should not have 'left'
+                right_index = tmp_tensor_2.ax_to_index('right')
+                #tmp_tensor_2.axes_names[left_index] = 'L_2'
+                tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                left_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d0')
+                
+                # For every other tensor on the left of B, repeat process
+                for i in range(1, self.l_pos): 
+
+                    tmp_tensor = copy.deepcopy(self.As[i])
+                    tmp_tensor_2 = copy.deepcopy(self.As[i])
+                    left_index = tmp_tensor_2.ax_to_index('left')
+                    right_index = tmp_tensor_2.ax_to_index('right')
+                    tmp_tensor_2.axes_names[left_index] = 'L_2'
+                    tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                    input_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d'+str(i))
+                    left_contr = contract(left_contr, input_contr, 
+                                          left_contr.ax_to_index(['right','R_2']), 
+                                          input_contr.ax_to_index(['left','L_2']))            
+            else:
+                left_contr = None
+
+
+            # Contract tensors on the right (if needed)
+            if self.l_pos != self.N-2:
+                
+                # copy tensor and rename indexes before contracting it to itself
+                tmp_tensor = copy.deepcopy(self.As[-1])
+                tmp_tensor_2 = copy.deepcopy(self.As[-1])
+                left_index = tmp_tensor_2.ax_to_index('left')
+                #right_index = tmp_tensor_2.ax_to_index('right')  # As[-1] should not have 'right'
+                tmp_tensor_2.axes_names[left_index] = 'L_2'
+                #tmp_tensor_2.axes_names[right_index] = 'R_2'
+                right_contr = contract(tmp_tensor, tmp_tensor_2, 'd'+str(self.N-1), 'd'+str(self.N-1))
+
+                # For every other tensor on the right of B, repeat process
+                for i in range(self.N-2, self.l_pos+1, -1): 
+
+                    tmp_tensor = copy.deepcopy(self.As[i])
+                    tmp_tensor_2 = copy.deepcopy(self.As[i])
+                    left_index = tmp_tensor_2.ax_to_index('left')
+                    right_index = tmp_tensor_2.ax_to_index('right')
+                    tmp_tensor_2.axes_names[left_index] = 'L_2'
+                    tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                    # Contract input index of the 2 tensors and then both
+                    # its 'left' indexes with the 'right' ones of right_contr
+                    #print(tmp_tensor)
+                    #print(tmp_tensor_2)
+                    input_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d'+str(i))
+                    right_contr = contract(input_contr, right_contr, 
+                                           input_contr.ax_to_index(['right','R_2']), 
+                                           right_contr.ax_to_index(['left','L_2']))                          
+            else:
+                right_contr = None
+
+        else: 
+
+            # Case of left_sweep (l from N-1 to 1):
+            # Contract tensors on the left (if needed)
+            if self.l_pos != 1:
+
+                # copy tensor and rename indexes before contracting it to itself
+                tmp_tensor = copy.deepcopy(self.As[0])
+                tmp_tensor_2 = copy.deepcopy(self.As[0])
+                #left_index = tmp_tensor_2.ax_to_index('left')    # As[0] should not have 'left'
+                right_index = tmp_tensor_2.ax_to_index('right')
+                #tmp_tensor_2.axes_names[left_index] = 'L_2'
+                tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                left_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d0')
+
+                # For every other tensor on the left of B, repeat process
+                for i in range(1, self.l_pos-1): 
+                    
+                    tmp_tensor = copy.deepcopy(self.As[i])
+                    tmp_tensor_2 = copy.deepcopy(self.As[i])
+                    left_index = tmp_tensor_2.ax_to_index('left')
+                    right_index = tmp_tensor_2.ax_to_index('right')
+                    tmp_tensor_2.axes_names[left_index] = 'L_2'
+                    tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                    input_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d'+str(i))
+                    left_contr = contract(left_contr, input_contr, 
+                                          left_contr.ax_to_index(['right','R_2']), 
+                                          input_contr.ax_to_index(['left','L_2']))
+            else:
+                left_contr = None
+
+            # Contract tensors on the left (if needed)
+            if self.l_pos != self.N-1:
+
+                # copy tensor and rename indexes before contracting it to itself
+                tmp_tensor = copy.deepcopy(self.As[-1])
+                tmp_tensor_2 = copy.deepcopy(self.As[-1])
+                left_index = tmp_tensor_2.ax_to_index('left')
+                #right_index = tmp_tensor_2.ax_to_index('right')  # As[-1] should not have 'right'
+                tmp_tensor_2.axes_names[left_index] = 'L_2'
+                #tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                right_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d'+str(self.N-1))
+
+                for i in range(self.N-2, self.l_pos, -1): 
+
+                    tmp_tensor = copy.deepcopy(self.As[i])
+                    tmp_tensor_2 = copy.deepcopy(self.As[i])
+                    left_index = tmp_tensor_2.ax_to_index('left')
+                    right_index = tmp_tensor_2.ax_to_index('right')
+                    tmp_tensor_2.axes_names[left_index] = 'L_2'
+                    tmp_tensor_2.axes_names[right_index] = 'R_2'
+
+                    input_contr = contract(tmp_tensor, tmp_tensor_2, contracted='d'+str(i))
+                    right_contr = contract(input_contr, right_contr, 
+                                           input_contr.ax_to_index(['right','R_2']), 
+                                           right_contr.ax_to_index(['left','L_2']))
+            else:
+                right_contr = None
+
+
+        # Compute d/dB of the L2 norm of the net by contracting the net only to one tensor B
+        if (right_contr is not None) and (left_contr is not None):
+            derivate = contract(B, right_contr, 'right', 'left')
+            derivate = contract(left_contr, derivate, 'right', 'left')
+        elif left_contr is None:
+            derivate = contract(B, right_contr, 'right', 'left')
+        elif right_contr is None:
+            derivate = contract(left_contr, B, 'right', 'left')
+
+
+        # Rename and swap left right index to obtain the correct shape of the derivate
+        if inverse == False:
+
+            if self.l_pos == 0:
+                left_index = derivate.ax_to_index('L_2')
+                derivate.axes_names[left_index] = 'right'
+            elif (self.l_pos > 0) and (self.l_pos < (self.N-2)):
+                left_index = derivate.ax_to_index('L_2')
+                right_index = derivate.ax_to_index('R_2')
+                derivate.axes_names[left_index] = 'right'
+                derivate.axes_names[right_index] = 'left'
+            else: 
+                right_index = derivate.ax_to_index('R_2')
+                derivate.axes_names[right_index] = 'left'
+
+        else:
+
+            if self.l_pos == 1:
+                left_index = derivate.ax_to_index('L_2')
+                derivate.axes_names[left_index] = 'right'
+            elif (self.l_pos > 1) and (self.l_pos < (self.N-1)):
+                left_index = derivate.ax_to_index('L_2')
+                right_index = derivate.ax_to_index('R_2')
+                derivate.axes_names[left_index] = 'right'
+                derivate.axes_names[right_index] = 'left'
+            else: 
+                right_index = derivate.ax_to_index('R_2')
+                derivate.axes_names[right_index] = 'left'
+
+
+
+        # Compute the loss contribution of the regularization
+        indexes = B.axes_names
+        loss_term = contract(B, derivate, 
+                             B.ax_to_index(indexes), 
+                             derivate.ax_to_index(indexes)).elem
+
+        # Scale tensors elements with input constants
+        derivate.elem = 2*weight_dec * derivate.elem
+        loss_term = weight_dec * loss_term
+
+        return loss_term, derivate
