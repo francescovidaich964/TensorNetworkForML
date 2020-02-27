@@ -771,7 +771,7 @@ class Network():
         ########## DEBUG ##########
         # Store history of B, deltaB, accuracy, output and MAE before the update:
         if var_hist is not None:
-            var_hist[0].append(B.elem.sum())
+            var_hist[0].append(np.abs(B.elem).mean())
             var_hist[1].append(np.abs(deltaB.elem).mean())
             var_hist[2].append(accuracy)
             var_hist[3].append(np.abs(f_tmp).mean())
