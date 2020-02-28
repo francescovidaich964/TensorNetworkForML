@@ -56,7 +56,7 @@ class Network():
     where all the tensors are contracted both to the left and to the right.
     """
     
-    def __init__(self, N, M, D=2, L=10, normalize=False, calibration_X=None):
+    def __init__(self, N, M, D=2, L=10, T=0.1, normalize=False, calibration_X=None, act_fn='linear', loss_fn='cross_entropy'):
         """
         Parameters
         ----------
@@ -80,12 +80,24 @@ class Network():
         self.D = D
         self.L = L
         self.M = M
+        self.T = T  # temperature for softmax
         
         self.As = []
 
-        # position of the tensor with additional dimension for the output of the net
+        # Initial position of the tensor with additional dimension for the output of the net
         self.l_pos = 0
         
+        # Choose output activation function
+        possible_act_fn = ['linear', 'sigmoid', 'softmax']
+        assert act_fn in possible_act_fn, "Please select an activation function between 'linear', 'sigmoid', 'softmax'"
+        self.act_fn = act_fn
+
+        # Choose output activation function
+        possible_loss_fn = ['MSE', 'cross_entropy', 'full_cross_ent']
+        assert loss_fn in possible_loss_fn, "Please select a loss function between 'MSE', 'cross_entropy', 'full_cross_ent'"      
+        self.loss_fn = loss_fn
+
+
         if normalize:
             print('Normalizing weights...')
             # output goes like [M E(A) E(x) D]^N
@@ -144,6 +156,7 @@ class Network():
 
         return
     
+
 
     def forward(self, X):
         """
@@ -213,7 +226,7 @@ class Network():
 
 
 
-    def train(self, train_loader, val_loader, lr, n_epochs = 10, weight_dec=0.001, early_stopping = False, print_freq = 100):
+    def train(self, train_loader, val_loader, lr, n_epochs=10, weight_dec=0.001, early_stopping=False, print_freq=100):
         """
         Trains the network
         
@@ -302,6 +315,7 @@ class Network():
         return train_acc, val_acc, var_hist
     
 
+
     def accuracy(self, X, y, f=None):
         """
         Computes the accuracy of the networks' predictions
@@ -344,7 +358,7 @@ class Network():
         y: numpy array of int
             Prediction targets of shape (batch_size,)
         f: Tensor
-            Result of net.forward(X)
+            Result of net.forward(X) (i.e. the non activated output)
         lr: float in (0,1]
             Learning rate that multiplies the gradient
             
@@ -372,8 +386,6 @@ class Network():
             f = self.sweep_step(f, y, lr, batch_size, weight_dec, left_dir, var_hist)
         
         return f
-
-
 
 
 
@@ -411,144 +423,9 @@ class Network():
         # Compute the B tensor at current l      
         B = contract(self.As[l-ldf], self.As[l+1-ldf], "right", "left")    
 
-
-
-        ##### COMPUTING all elements for DELTA_B #####
-        #   Contributions (R or L case):
-        #   - TX[l] or TX[l-1]   (always)
-        #   - TX[l+1] or TX[l]   (always)
-        #   - left_contribution or l_cum_contraction[l+2]   (for l > 0)
-        #   - r_cum_contraction[-(l+2)] or right_contribution  (for l < N-2)
-        #   - y-f    (always)
-            
-        # Start by contracting the two inputs of B
-        phi = contract(self.TX[l-ldf], self.TX[l+1-ldf], common="b")
-        
-        # Contract the rest of the network (right and left sweeps are handled differently)
-        if left_dir == False:  # Sweep to the R direction
-
-            if l == 0:
-                # The entire net is on the right of B -> no need to contract to the left
-                phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
-            
-            elif (l > 0) and (l < (self.N-2)):
-
-                # Compute new term for the left contribute and add to l_cum_contraction
-                new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
-                if l==1:
-                    self.l_cum_contraction.append(new_contribution)
-                else:
-                    tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
-                    self.l_cum_contraction.append(tmp) 
-                
-                # Contract tensors on the right and on the left of B
-                phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
-                phi = contract(phi, self.l_cum_contraction[-1], common = "b")
-                
-            elif l == (self.N-2):
-                # Compute new term for the left contribute and add to l_cum_contraction
-                new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
-                tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
-                self.l_cum_contraction.append(tmp) 
-                
-                # The entire net is on the left of B -> no need to contract to the right
-                phi = contract(phi, self.l_cum_contraction[-1], common = "b")
-                
-            else:
-                raise Exception('### Error ###\n l =',l,' -> position not allowed for right sweep step')
-
-        else:  # Sweep to the L direction
-
-            if l == self.N-1:
-                # The entire net is on the right of B -> no need to contract to the left
-                phi = contract(phi, self.l_cum_contraction[-3], common = "b")
-                
-            elif (l > 1) and (l < (self.N-1)):
-
-                # Compute new term for the right contribute and add to r_cum_contraction
-                new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
-                if l==self.N-2:
-                    self.r_cum_contraction.append(new_contribution)
-                else:
-                    tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
-                    self.r_cum_contraction.append(tmp) 
-                
-                # Contract tensors on the right and on the left of B
-                phi = contract(phi, self.r_cum_contraction[-1], common = "b")
-                phi = contract(phi, self.l_cum_contraction[l-2], common = "b")
-             
-            elif l == 1:
-                # Compute new term for the right contribute and add to r_cum_contraction
-                new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
-                tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
-                self.r_cum_contraction.append(tmp)
-
-                # The entire net is on the right of B -> no need to contract to the left
-                phi = contract(phi, self.r_cum_contraction[-1], common = "b")
-
-            else:
-                raise Exception('### Error ###\n l =',l,' -> position not allowed for left sweep step')
-
-        ######################################################
-        # DEBUG: compute accuracy and Mean Absolute Error 
-        y_pred = np.argmax(f.elem, axis=0) 
-        y_target = np.argmax(y, axis=0) 
-        errors = (y_target!=y_pred).sum()
-        accuracy = (len(y_pred)-errors)/len(y_pred)
-
-        MAE = np.abs(y-f.elem).mean()
-        ######################################################
-        
-        # Contract output error with the whole (contracted) network without B
-        #f.elem = y-f.elem # overwrite f with (target - prediction)
-        f_tmp = f.elem
-        f.elem = y/f.elem
-        deltaB = contract(f, phi, contracted="b")
-
-        # Swap left and right indixes to retrieve the correct shape of Delta_B
-        if l == (0+ldf):
-            left_index = deltaB.ax_to_index('left')
-            deltaB.axes_names[left_index] = 'right'
-        elif (l > (0+ldf)) and (l < (self.N-2+ldf)):
-            left_index = deltaB.ax_to_index('left')
-            right_index = deltaB.ax_to_index('right')
-            deltaB.axes_names[left_index] = 'right'
-            deltaB.axes_names[right_index] = 'left'
-        else: 
-            right_index = deltaB.ax_to_index('right')
-            deltaB.axes_names[right_index] = 'left'
-
-
-
-
-        ##### UPDATE B #####
-
-        # Perform L2 regularization
-        L2_loss_term, L2_gradient = self.compute_L2_reg(B, weight_dec, left_dir)
-        deltaB -= L2_gradient
-
-        ########## DEBUG ##########
-        # Store history of B, deltaB, accuracy, output and MAE before the update:
-        if var_hist is not None:
-            var_hist[0].append(np.abs(B.elem).mean())
-            var_hist[1].append(np.abs(deltaB.elem).mean())
-            var_hist[2].append(accuracy)
-            var_hist[3].append(np.abs(f_tmp).mean())
-            var_hist[4].append(MAE)
-            var_hist[5].append(L2_loss_term)
-            var_hist[6].append(np.abs(L2_gradient.elem).mean())
-        ###########################
-
-        # Gradient clipping -> Rescale all elements of the gradient so that the
-        # norm does not exceed the sum of the absolute values of B's entries
-        B_measure = np.abs(B.elem).sum()
-        if np.abs(deltaB.elem).sum() > B_measure:
-            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
-
         # Perform the update of B
-        deltaB.elem *= lr
-        B = B + deltaB
-        
+        B = self.update_B(B, f, y, lr, weight_dec, ldf, var_hist)
+
 
 
         ##### Compute new output of the network using the updated B #####
@@ -583,8 +460,9 @@ class Network():
             else:
                 # No right term
                 out = contract(out, self.r_cum_contraction[-1], 'right', 'left', common = "b") 
-            
 
+        # Use the activation function for the output of the net 
+        # out = self.apply_act_func(out) (FUNCTION RETURNS THE NON-ACTIVATED OUTPUT)
 
 
         ##### Reconstruct network tensors by splitting B with SVD #####
@@ -664,7 +542,222 @@ class Network():
     
 
 
+    def update_B(self, B, f_orig, y, lr, weight_dec, ldf=0, var_hist=None):
+
+        ####### COMPUTING all elements for DELTA_B #######
+        #   Contributions (R or L case):
+        #   - TX[l] or TX[l-1]   (always)
+        #   - TX[l+1] or TX[l]   (always)
+        #   - left_contribution or l_cum_contraction[l+2]   (for l > 0)
+        #   - r_cum_contraction[-(l+2)] or right_contribution  (for l < N-2)
+        #   - y-f    (always)
+            
+        # Start by contracting the two inputs of B
+        l = self.l_pos
+        phi = contract(self.TX[l-ldf], self.TX[l+1-ldf], common="b")
+        
+        # Contract the rest of the network (right and left sweeps are handled differently)
+        if ldf == 0:  # Sweep to the R direction
+
+            if l == 0:
+                # The entire net is on the right of B -> no need to contract to the left
+                phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
+            
+            elif (l > 0) and (l < (self.N-2)):
+
+                # Compute new term for the left contribute and add to l_cum_contraction
+                new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
+                if l==1:
+                    self.l_cum_contraction.append(new_contribution)
+                else:
+                    tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
+                    self.l_cum_contraction.append(tmp) 
+                
+                # Contract tensors on the right and on the left of B
+                phi = contract(phi, self.r_cum_contraction[l+2], common = "b")
+                phi = contract(phi, self.l_cum_contraction[-1], common = "b")
+                
+            elif l == (self.N-2):
+                # Compute new term for the left contribute and add to l_cum_contraction
+                new_contribution = contract(self.As[l-1], self.TX[l-1], contracted='d'+str(l-1))
+                tmp = contract(self.l_cum_contraction[-1], new_contribution, 'right', 'left', common='b')
+                self.l_cum_contraction.append(tmp) 
+                
+                # The entire net is on the left of B -> no need to contract to the right
+                phi = contract(phi, self.l_cum_contraction[-1], common = "b")
+                
+            else:
+                raise Exception('### Error ###\n l =',l,' -> position not allowed for right sweep step')
+
+        else:  # Sweep to the L direction
+
+            if l == self.N-1:
+                # The entire net is on the right of B -> no need to contract to the left
+                phi = contract(phi, self.l_cum_contraction[-3], common = "b")
+                
+            elif (l > 1) and (l < (self.N-1)):
+
+                # Compute new term for the right contribute and add to r_cum_contraction
+                new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
+                if l==self.N-2:
+                    self.r_cum_contraction.append(new_contribution)
+                else:
+                    tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
+                    self.r_cum_contraction.append(tmp) 
+                
+                # Contract tensors on the right and on the left of B
+                phi = contract(phi, self.r_cum_contraction[-1], common = "b")
+                phi = contract(phi, self.l_cum_contraction[l-2], common = "b")
+             
+            elif l == 1:
+                # Compute new term for the right contribute and add to r_cum_contraction
+                new_contribution = contract(self.As[l+1], self.TX[l+1], contracted='d'+str(l+1))
+                tmp = contract(new_contribution, self.r_cum_contraction[-1], 'right', 'left', common='b')
+                self.r_cum_contraction.append(tmp)
+
+                # The entire net is on the right of B -> no need to contract to the left
+                phi = contract(phi, self.r_cum_contraction[-1], common = "b")
+
+            else:
+                raise Exception('### Error ###\n l =',l,' -> position not allowed for left sweep step')
+
+
+        # Use the activation function for the output of the net 
+        f = self.apply_act_func(f_orig)
+
+        # Compute the derivate of the loss function
+        loss_der = self.compute_loss_derivate(f, y)
+
+        ######################################################
+        # DEBUG: compute accuracy and Mean Absolute Error 
+        y_pred = np.argmax(f.elem, axis=0) 
+        y_target = np.argmax(y, axis=0) 
+        errors = (y_target!=y_pred).sum()
+        accuracy = (len(y_pred)-errors)/len(y_pred)
+
+        MAE = np.abs(y-f.elem).mean()
+        ######################################################
+
+        # Contract output error with the whole (contracted) network without B
+        deltaB = contract(loss_der, phi, contracted="b")
+
+
+        # Swap left and right indixes to retrieve the correct shape of Delta_B
+        if l == (0+ldf):
+            left_index = deltaB.ax_to_index('left')
+            deltaB.axes_names[left_index] = 'right'
+        elif (l > (0+ldf)) and (l < (self.N-2+ldf)):
+            left_index = deltaB.ax_to_index('left')
+            right_index = deltaB.ax_to_index('right')
+            deltaB.axes_names[left_index] = 'right'
+            deltaB.axes_names[right_index] = 'left'
+        else: 
+            right_index = deltaB.ax_to_index('right')
+            deltaB.axes_names[right_index] = 'left'
+
+
+        # Perform L2 regularization
+        L2_loss_term, L2_gradient = self.compute_L2_reg(B, weight_dec, ldf)
+        deltaB -= L2_gradient
+
+
+        ############################
+        # DEBUG: Store history of variables before the update:
+        if var_hist is not None:
+            var_hist[0].append(np.abs(B.elem).mean())
+            var_hist[1].append(np.abs(deltaB.elem).mean())
+            var_hist[2].append(accuracy)
+            var_hist[3].append(np.abs(f_orig.elem).mean())
+            var_hist[4].append(MAE)
+            var_hist[5].append(L2_loss_term)
+            var_hist[6].append(np.abs(L2_gradient.elem).mean())
+        ###########################
+
+        # Gradient clipping -> Rescale all elements of the gradient so that the
+        # norm does not exceed the sum of the absolute values of B's entries
+        B_measure = np.abs(B.elem).sum()
+        if np.abs(deltaB.elem).sum() > B_measure:
+            deltaB.elem /= np.abs(deltaB.elem).sum()/B_measure
+
+        # Perform the update of B
+        deltaB.elem *= lr
+        B = B + deltaB
+
+        return B
     
+
+
+    def apply_act_func(self, f):
+        """
+        Apply the activation function (defined in __init__) to the 
+        output of the network (can be 'linear', 'cross_ent', 'full_cross_ent') 
+
+        Parameters
+        ----------
+        f: Tensor
+            Equivalent to self.forward(X)
+
+
+        Returns
+        -------
+        activation: Tensor
+            Output of the network after the Activation function
+        """
+
+        # Create a tensor with the same shape and elements of f
+        activation = copy.deepcopy(f)
+
+        # Apply activation function
+        if self.act_fn == 'linear':  # linear activation is identity transform on f
+            pass 
+        elif self.act_fn == 'sigmoid':
+            activation.elem = 1./(1.+np.exp(-activation.elem/self.T)) # a = 1/(1+e^-f)
+        elif self.act_fn == 'softmax':
+            label_axis = activation.ax_to_index('l')
+            activation.elem = np.exp(activation.elem/self.T)/np.exp(activation.elem/self.T).sum(axis=label_axis)
+
+        return activation
+
+
+
+    def compute_loss_derivate(self, f, y):
+        """
+        Given (activated) outputs and labels, compute the derivate of the loss function
+        with respect to the net output f (can be 'MSE', 'softmax', 'full_cross_ent') 
+
+        Parameters
+        ----------
+        f: Tensor
+            Output of the network after the activation function
+        y: numpy array of int
+            One hot encoded version of the prediction targets
+            Shape is (batch_size,L)
+
+        Returns
+        -------
+        loss_der: Tensor
+            derivate of the 
+        """
+
+        # Create a tensor with the same shape of f
+        loss_der = copy.deepcopy(f)
+
+        # Compute loss value
+        if self.loss_fn == 'MSE':
+            loss_der.elem = y - f.elem
+        elif self.loss_fn == 'cross_entropy':
+            if self.act_fn == 'softmax':
+                print("softmax + cross entropy case")
+                loss_der.elem = (y - y*f.elem)/self.T # simplyfied computations
+            else:
+                loss_der.elem = y/f.elem
+        elif self.loss_fn == 'full_cross_ent':
+            loss_der.elem[y == 0] = loss_der.elem[y == 0]  - 1
+            loss_der.elem = 1./(loss_der.elem+1e-4)
+
+        return loss_der
+
+
 
     def tensor_svd(self, T, left_dir=False, threshold=0.999):
         """
@@ -809,6 +902,7 @@ class Network():
             TSVh.disaggregate('j')
 
             return TUS, TSVh#, cumulative_variance_explained[m-1]
+
 
 
     def compute_L2_reg(self, B, weight_dec=0.001, left_dir=False):
@@ -1005,8 +1099,9 @@ class Network():
 
 
 
-
+    #########################################
     ############# OLD METHODS ###############
+    #########################################
 
     def r_sweep(self, X, y, f, lr, weight_dec, var_hist=None):
         """
